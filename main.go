@@ -13,8 +13,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chzyer/readline"
+	"github.com/gookit/color"
 	"github.com/kc2g-flex-tools/flexclient"
 	"github.com/rs/zerolog"
+
 	log "github.com/rs/zerolog/log"
 )
 
@@ -24,7 +27,6 @@ var cfg struct {
 	Callsign      string
 	ClusterServer string
 	Timeout       time.Duration
-	Filter        string
 }
 
 func init() {
@@ -33,11 +35,10 @@ func init() {
 	flag.StringVar(&cfg.Callsign, "callsign", "", "callsign for login")
 	flag.StringVar(&cfg.ClusterServer, "server", "", "cluster server to connect to")
 	flag.DurationVar(&cfg.Timeout, "timeout", 5*time.Minute, "spot persistence timeout")
-	flag.StringVar(&cfg.Filter, "filter", "", "spot filter")
 }
 
 func main() {
-	spotPattern := regexp.MustCompile(`^DX de (\S+?):\s+([0-9.]+)\s+(\S+?)\s+(.*?)\s*[0-9]{4}Z`)
+	spotPattern := regexp.MustCompile(`^DX de (\S+?):\s*([0-9.]+)\s+(\S+?)\s+(.*?)\s*[0-9]{4}Z`)
 
 	log.Logger = zerolog.New(
 		zerolog.ConsoleWriter{
@@ -46,11 +47,6 @@ func main() {
 	).With().Timestamp().Logger()
 
 	flag.Parse()
-	if cfg.Callsign == "" {
-		flag.Usage()
-		log.Fatal().Msg("-callsign is required")
-	}
-
 	if cfg.ClusterServer == "" {
 		flag.Usage()
 		log.Fatal().Msg("-server is required")
@@ -66,6 +62,18 @@ func main() {
 		log.Fatal().Err(err).Send()
 	}
 
+	prompt := color.FgLightMagenta.Render("cluster") + "> "
+	rl, err := readline.New(prompt)
+	if err != nil {
+		log.Fatal().Err(err).Msg("creating readline")
+	}
+
+	log.Logger = zerolog.New(
+		zerolog.ConsoleWriter{
+			Out: rl.Stderr(),
+		},
+	).With().Timestamp().Logger()
+
 	go func() {
 		c := make(chan os.Signal, 1)
 		signal.Notify(c, os.Interrupt)
@@ -78,7 +86,7 @@ func main() {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
-		lifetimeSecs := cfg.Timeout / time.Second
+		lifetimeSecs := int(cfg.Timeout / time.Second)
 
 		lines := bufio.NewScanner(tc)
 		for lines.Scan() {
@@ -90,7 +98,11 @@ func main() {
 					log.Error().Err(err).Send()
 					continue
 				}
-				log.Info().Str("spotter", spotCall).Str("freq", freq).Str("dx", dxCall).Str("comment", comment).Msg("spot")
+				fmt.Fprintln(
+					rl.Stdout(),
+					color.FgLightGreen.Render("SPOT"), " ", m[0],
+				)
+
 				strings.ReplaceAll(spotCall, " ", "\x7f")
 				strings.ReplaceAll(freq, " ", "\x7f")
 				strings.ReplaceAll(dxCall, " ", "\x7f")
@@ -99,22 +111,47 @@ func main() {
 				if res.Error != 0 {
 					log.Error().Uint32("error", res.Error).Msg(res.Message)
 				}
+			} else if strings.HasSuffix(line, ">") {
+				rl.SetPrompt(color.FgMagenta.Render(strings.TrimSuffix(line, ">")) + "> ")
+				rl.Refresh()
+			} else if strings.HasSuffix(line, "> ") {
+				rl.SetPrompt(color.FgMagenta.Render(strings.TrimSuffix(line, "> ")) + "> ")
+				rl.Refresh()
 			} else {
-				log.Info().Msg(line)
+				fmt.Fprintln(rl.Stdout(), line)
 			}
 		}
 		fc.Close()
 		wg.Done()
 	}()
 
+	wg.Add(1)
 	go func() {
 		fc.Run()
 		tc.Close()
 		wg.Done()
 	}()
 
-	fmt.Fprintf(tc, "%s\n", cfg.Callsign)
-	fmt.Fprintf(tc, "set dx filter %s\n", cfg.Filter)
+	wg.Add(1)
+	go func() {
+		for {
+			line, err := rl.Readline()
+			if err != nil {
+				break
+			}
+			if line == "" {
+				continue
+			}
+			fmt.Fprintln(tc, line)
+		}
+		fc.Close()
+		wg.Done()
+	}()
+
+	if cfg.Callsign != "" {
+		time.Sleep(time.Second)
+		fmt.Fprintf(tc, "%s\n", cfg.Callsign)
+	}
 
 	wg.Wait()
 }
