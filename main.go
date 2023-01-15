@@ -38,7 +38,10 @@ func init() {
 }
 
 func main() {
-	spotPattern := regexp.MustCompile(`^DX de (\S+?):\s*([0-9.]+)\s+(\S+?)\s+(.*?)\s*[0-9]{4}Z`)
+	spotPattern := regexp.MustCompile(`^DX de (\S+?)(:?\s*)([0-9.]+)(\s+)(\S+?)(\s+)(.*?)(\s*)([0-9]{4}Z)`)
+	qrtPattern := regexp.MustCompile(`\b(?i:QRT)\b`)
+
+	promptSuffixes := []string{">", "> ", ":", ": "}
 
 	log.Logger = zerolog.New(
 		zerolog.ConsoleWriter{
@@ -92,15 +95,28 @@ func main() {
 		for lines.Scan() {
 			line := lines.Text()
 			if m := spotPattern.FindStringSubmatch(line); m != nil {
-				spotCall, freq, dxCall, comment := m[1], m[2], m[3], m[4]
+				spotCall, freq, dxCall, comment, ts := m[1], m[3], m[5], m[7], m[9]
 				freqKhz, err := strconv.ParseFloat(freq, 64)
 				if err != nil {
 					log.Error().Err(err).Send()
 					continue
 				}
+
+				var commentColor = color.FgLightCyan
+				if qrtPattern.MatchString(comment) {
+					// TODO: actually remove the spot. That will need some
+					// refactoring to remember the IDs of spots we add, though.
+					commentColor = color.FgLightRed
+				}
+
 				fmt.Fprintln(
 					rl.Stdout(),
-					color.FgLightGreen.Render("SPOT"), " ", m[0],
+					color.FgLightGreen.Render("SPOT")+" "+
+						"DX de "+color.FgYellow.Render(spotCall)+
+						m[2]+color.FgLightBlue.Render(freq)+
+						m[4]+color.FgMagenta.Render(dxCall)+
+						m[6]+commentColor.Render(comment)+
+						m[8]+ts,
 				)
 
 				strings.ReplaceAll(spotCall, " ", "\x7f")
@@ -111,14 +127,19 @@ func main() {
 				if res.Error != 0 {
 					log.Error().Uint32("error", res.Error).Msg(res.Message)
 				}
-			} else if strings.HasSuffix(line, ">") {
-				rl.SetPrompt(color.FgMagenta.Render(strings.TrimSuffix(line, ">")) + "> ")
-				rl.Refresh()
-			} else if strings.HasSuffix(line, "> ") {
-				rl.SetPrompt(color.FgMagenta.Render(strings.TrimSuffix(line, "> ")) + "> ")
-				rl.Refresh()
 			} else {
-				fmt.Fprintln(rl.Stdout(), line)
+				var prompt = false
+				for _, suffix := range promptSuffixes {
+					if strings.HasSuffix(line, suffix) {
+						rl.SetPrompt(color.FgMagenta.Render(strings.TrimSuffix(line, suffix)) + "> ")
+						rl.Refresh()
+						prompt = true
+						break
+					}
+				}
+				if !prompt {
+					fmt.Fprintln(rl.Stdout(), line)
+				}
 			}
 		}
 		fc.Close()
