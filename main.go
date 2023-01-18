@@ -233,11 +233,17 @@ func main() {
 		<-c
 		log.Info().Msg("Exit on SIGINT")
 		fc.Close()
-		tc.Close()
 	}()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
+	go func() {
+		fc.Run()
+		tc.Close()
+		rl.Close()
+		wg.Done()
+	}()
+
 	go func() {
 		lines := bufio.NewScanner(tc)
 		for lines.Scan() {
@@ -263,17 +269,8 @@ func main() {
 			}
 		}
 		fc.Close()
-		wg.Done()
 	}()
 
-	wg.Add(1)
-	go func() {
-		fc.Run()
-		tc.Close()
-		wg.Done()
-	}()
-
-	wg.Add(1)
 	go func() {
 		for {
 			line, err := rl.Readline()
@@ -286,7 +283,6 @@ func main() {
 			fmt.Fprintln(tc, line)
 		}
 		fc.Close()
-		wg.Done()
 	}()
 
 	if cfg.Callsign != "" {
