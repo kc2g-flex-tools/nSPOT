@@ -24,13 +24,21 @@ import (
 
 const SpotNotFoundError = 0x500000BC
 
+const (
+	None = iota
+	PerFreq
+	PerBand
+	Global
+)
+
 var cfg struct {
 	RadioIP       string
 	Station       string
 	Callsign      string
 	ClusterServer string
 	QRT           bool
-	OnePerBand    bool
+	Deduplicate   int
+	dedupStr      string
 	Timeout       time.Duration
 }
 
@@ -41,7 +49,7 @@ func init() {
 	flag.StringVar(&cfg.ClusterServer, "server", "", "cluster server to connect to")
 	flag.DurationVar(&cfg.Timeout, "timeout", 5*time.Minute, "spot persistence timeout")
 	flag.BoolVar(&cfg.QRT, "qrt", true, "delete spots with QRT in comment")
-	flag.BoolVar(&cfg.OnePerBand, "one-per-band", true, "expect a given callsign only once per band")
+	flag.StringVar(&cfg.dedupStr, "deduplicate", "per-band", "de-duplicate spots for the same callsign [none|per-freq|per-band|global]")
 }
 
 func logToConsole(w io.Writer, m []string, remove bool) {
@@ -122,10 +130,17 @@ func sendToFlex(fc *flexclient.FlexClient, m []string, remove bool) {
 		return
 	}
 	var key spotKey
-	if cfg.OnePerBand {
-		key = spotKey{freq: getBand(freqKhz), call: dxCall}
-	} else {
+	switch cfg.Deduplicate {
+	case None:
+		// key not used
+	case PerFreq:
 		key = spotKey{freq: fmt.Sprintf("%.0f", freqKhz), call: dxCall} // round to nearest kHz
+	case PerBand:
+		key = spotKey{freq: getBand(freqKhz), call: dxCall}
+	case Global:
+		key = spotKey{freq: "global", call: dxCall}
+	default:
+		panic("cfg.Deduplicate")
 	}
 
 	strings.ReplaceAll(spotCall, " ", "\x7f")
@@ -144,8 +159,15 @@ func addSpot(fc *flexclient.FlexClient, key spotKey, spotCall string, freqKhz fl
 	lifetimeSecs := int(cfg.Timeout / time.Second)
 	fields := fmt.Sprintf("rx_freq=%f callsign=%s spotter_callsign=%s comment=%s lifetime_seconds=%d", freqKhz/1000.0, dxCall, spotCall, comment, lifetimeSecs)
 
-	var res flexclient.CmdResult
-	sp, existed := spotIds[key]
+	var (
+		res     flexclient.CmdResult
+		sp      spot
+		existed bool
+	)
+
+	if cfg.Deduplicate != None {
+		sp, existed = spotIds[key]
+	}
 	if existed {
 		// Spot already exists for band/mode, update instead of adding
 		res = fc.SendAndWait(fmt.Sprintf("spot set %d %s", sp.id, fields))
@@ -159,18 +181,24 @@ func addSpot(fc *flexclient.FlexClient, key spotKey, spotCall string, freqKhz fl
 		return
 	}
 
-	if !existed {
-		id, err := strconv.Atoi(res.Message)
-		if err != nil {
-			log.Error().Err(err).Msg("atoi")
-			return
+	if cfg.Deduplicate != None {
+		if !existed {
+			id, err := strconv.Atoi(res.Message)
+			if err != nil {
+				log.Error().Err(err).Msg("atoi")
+				return
+			}
+			sp.id = id
 		}
-		sp.id = id
+		spotIds[key] = spot{id: sp.id, expires: time.Now().Add(cfg.Timeout)}
 	}
-	spotIds[key] = spot{id: sp.id, expires: time.Now().Add(cfg.Timeout)}
 }
 
 func removeSpot(fc *flexclient.FlexClient, key spotKey) {
+	if cfg.Deduplicate == None {
+		return
+	}
+
 	spot, ok := spotIds[key]
 	if ok {
 		res := fc.SendAndWait(fmt.Sprintf("spot remove %d", spot.id))
@@ -182,6 +210,10 @@ func removeSpot(fc *flexclient.FlexClient, key spotKey) {
 }
 
 func cleanupSpots() {
+	if cfg.Deduplicate == None {
+		return
+	}
+
 	now := time.Now()
 	for k, v := range spotIds {
 		if v.expires.Before(now) {
@@ -206,6 +238,20 @@ func main() {
 	if cfg.ClusterServer == "" {
 		flag.Usage()
 		log.Fatal().Msg("-server is required")
+	}
+
+	switch cfg.dedupStr {
+	case "none":
+		cfg.Deduplicate = None
+	case "per-freq":
+		cfg.Deduplicate = PerFreq
+	case "per-band":
+		cfg.Deduplicate = PerBand
+	case "global":
+		cfg.Deduplicate = Global
+	default:
+		flag.Usage()
+		log.Fatal().Msg("invalid value for -deduplicate")
 	}
 
 	fc, err := flexclient.NewFlexClient(cfg.RadioIP)
