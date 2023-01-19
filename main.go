@@ -22,6 +22,8 @@ import (
 	log "github.com/rs/zerolog/log"
 )
 
+const SpotNotFoundError = 0x500000BC
+
 var cfg struct {
 	RadioIP       string
 	Station       string
@@ -147,7 +149,8 @@ func addSpot(fc *flexclient.FlexClient, key spotKey, spotCall string, freqKhz fl
 	if existed {
 		// Spot already exists for band/mode, update instead of adding
 		res = fc.SendAndWait(fmt.Sprintf("spot set %d %s", sp.id, fields))
-	} else {
+	}
+	if !existed || res.Error == SpotNotFoundError {
 		res = fc.SendAndWait(fmt.Sprintf("spot add %s", fields))
 	}
 
@@ -171,7 +174,7 @@ func removeSpot(fc *flexclient.FlexClient, key spotKey) {
 	spot, ok := spotIds[key]
 	if ok {
 		res := fc.SendAndWait(fmt.Sprintf("spot remove %d", spot.id))
-		if res.Error != 0 {
+		if res.Error != 0 && res.Error != SpotNotFoundError {
 			log.Error().Uint32("error", res.Error).Msg(res.Message)
 		}
 	}
