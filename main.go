@@ -58,19 +58,24 @@ func logToConsole(w io.Writer, m []string, remove bool) {
 		commentColor = color.FgLightRed
 	}
 
-	freqKhz, err := strconv.ParseFloat(m[3], 64)
+	spotColor := color.FgLightGreen
+	if m[1] == "-" {
+		spotColor = color.FgLightRed
+	}
+
+	freqKhz, err := strconv.ParseFloat(m[4], 64)
 	if err != nil {
 		log.Error().Err(err).Send()
 		return
 	}
 	fmt.Fprintln(
 		w,
-		color.FgLightGreen.Render("DX de")+
-			" "+color.FgYellow.Render(m[1])+
-			m[2]+color.FgLightBlue.Render(m[3])+
-			m[4]+color.FgMagenta.Render(m[5])+
-			m[6]+commentColor.Render(m[7])+
-			m[8]+m[9]+
+		spotColor.Render(m[1]+"DX de")+
+			" "+color.FgYellow.Render(m[2])+
+			m[3]+color.FgLightBlue.Render(m[4])+
+			m[5]+color.FgMagenta.Render(m[6])+
+			m[7]+commentColor.Render(m[8])+
+			m[9]+m[10]+
 			" "+color.FgLightGreen.Render(getBand(freqKhz)),
 	)
 }
@@ -123,7 +128,7 @@ type spot struct {
 var spotIds = map[spotKey]spot{}
 
 func sendToFlex(fc *flexclient.FlexClient, m []string, remove bool) {
-	spotCall, freq, dxCall, comment := m[1], m[3], m[5], m[7]
+	spotCall, freq, dxCall, comment := m[2], m[4], m[6], m[8]
 	freqKhz, err := strconv.ParseFloat(freq, 64)
 	if err != nil {
 		log.Error().Err(err).Send()
@@ -143,10 +148,9 @@ func sendToFlex(fc *flexclient.FlexClient, m []string, remove bool) {
 		panic("cfg.Deduplicate")
 	}
 
-	strings.ReplaceAll(spotCall, " ", "\x7f")
-	strings.ReplaceAll(freq, " ", "\x7f")
-	strings.ReplaceAll(dxCall, " ", "\x7f")
-	strings.ReplaceAll(comment, " ", "\x7f")
+	spotCall = strings.ReplaceAll(spotCall, " ", "\x7f")
+	dxCall = strings.ReplaceAll(dxCall, " ", "\x7f")
+	comment = strings.ReplaceAll(comment, " ", "\x7f")
 
 	if remove {
 		removeSpot(fc, key)
@@ -223,7 +227,7 @@ func cleanupSpots() {
 }
 
 func main() {
-	spotPattern := regexp.MustCompile(`^DX de (\S+?)(:?\s*)([0-9.]+)(\s+)(\S+?)(\s+)(.*?)(\s*)([0-9]{4}Z)`)
+	spotPattern := regexp.MustCompile(`^([-+]?)DX de (\S+?)(:?\s*)([0-9.]+)(\s+)(\S+?)(\s+)(.*?)(\s*)([0-9]{4}Z)`)
 	qrtPattern := regexp.MustCompile(`\b(?i:QRT)\b`)
 
 	promptSuffixes := []string{">", "> ", ":", ": "}
@@ -298,7 +302,7 @@ func main() {
 		for lines.Scan() {
 			line := lines.Text()
 			if m := spotPattern.FindStringSubmatch(line); m != nil {
-				remove := cfg.QRT && qrtPattern.MatchString(m[7])
+				remove := cfg.QRT && qrtPattern.MatchString(m[8])
 				logToConsole(rl.Stdout(), m, remove)
 				sendToFlex(fc, m, remove)
 				cleanupSpots()
