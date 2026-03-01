@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -11,7 +12,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/chzyer/readline"
@@ -127,7 +127,7 @@ type spot struct {
 
 var spotIds = map[spotKey]spot{}
 
-func sendToFlex(fc *flexclient.FlexClient, m []string, remove bool) {
+func sendToFlex(ctx context.Context, fc *flexclient.FlexClient, m []string, remove bool) {
 	spotCall, freq, dxCall, comment := m[2], m[4], m[6], m[8]
 	freqKhz, err := strconv.ParseFloat(freq, 64)
 	if err != nil {
@@ -153,13 +153,13 @@ func sendToFlex(fc *flexclient.FlexClient, m []string, remove bool) {
 	comment = strings.ReplaceAll(comment, " ", "\x7f")
 
 	if remove {
-		removeSpot(fc, key)
+		removeSpot(ctx, fc, key)
 	} else {
-		addSpot(fc, key, spotCall, freqKhz, dxCall, comment)
+		addSpot(ctx, fc, key, spotCall, freqKhz, dxCall, comment)
 	}
 }
 
-func addSpot(fc *flexclient.FlexClient, key spotKey, spotCall string, freqKhz float64, dxCall, comment string) {
+func addSpot(ctx context.Context, fc *flexclient.FlexClient, key spotKey, spotCall string, freqKhz float64, dxCall, comment string) {
 	lifetimeSecs := int(cfg.Timeout / time.Second)
 	fields := fmt.Sprintf("rx_freq=%f callsign=%s spotter_callsign=%s comment=%s lifetime_seconds=%d", freqKhz/1000.0, dxCall, spotCall, comment, lifetimeSecs)
 
@@ -167,6 +167,7 @@ func addSpot(fc *flexclient.FlexClient, key spotKey, spotCall string, freqKhz fl
 		res     flexclient.CmdResult
 		sp      spot
 		existed bool
+		err     error
 	)
 
 	if cfg.Deduplicate != None {
@@ -174,10 +175,18 @@ func addSpot(fc *flexclient.FlexClient, key spotKey, spotCall string, freqKhz fl
 	}
 	if existed {
 		// Spot already exists for band/mode, update instead of adding
-		res = fc.SendAndWait(fmt.Sprintf("spot set %d %s", sp.id, fields))
+		res, err = fc.SendAndWaitContext(ctx, fmt.Sprintf("spot set %d %s", sp.id, fields))
+		if err != nil {
+			log.Error().Err(err).Msg("failed to update spot")
+			return
+		}
 	}
 	if !existed || res.Error == SpotNotFoundError {
-		res = fc.SendAndWait(fmt.Sprintf("spot add %s", fields))
+		res, err = fc.SendAndWaitContext(ctx, fmt.Sprintf("spot add %s", fields))
+		if err != nil {
+			log.Error().Err(err).Msg("failed to add spot")
+			return
+		}
 	}
 
 	if res.Error != 0 {
@@ -198,15 +207,17 @@ func addSpot(fc *flexclient.FlexClient, key spotKey, spotCall string, freqKhz fl
 	}
 }
 
-func removeSpot(fc *flexclient.FlexClient, key spotKey) {
+func removeSpot(ctx context.Context, fc *flexclient.FlexClient, key spotKey) {
 	if cfg.Deduplicate == None {
 		return
 	}
 
 	spot, ok := spotIds[key]
 	if ok {
-		res := fc.SendAndWait(fmt.Sprintf("spot remove %d", spot.id))
-		if res.Error != 0 && res.Error != SpotNotFoundError {
+		res, err := fc.SendAndWaitContext(ctx, fmt.Sprintf("spot remove %d", spot.id))
+		if err != nil {
+			log.Error().Err(err).Msg("failed to remove spot")
+		} else if res.Error != 0 && res.Error != SpotNotFoundError {
 			log.Error().Uint32("error", res.Error).Msg(res.Message)
 		}
 	}
@@ -262,17 +273,20 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Send()
 	}
+	defer fc.Close()
 
 	tc, err := net.Dial("tcp", cfg.ClusterServer)
 	if err != nil {
 		log.Fatal().Err(err).Send()
 	}
+	defer tc.Close()
 
 	prompt := color.FgLightMagenta.Render("cluster") + "> "
 	rl, err := readline.New(prompt)
 	if err != nil {
 		log.Fatal().Err(err).Msg("creating readline")
 	}
+	defer rl.Close()
 
 	log.Logger = zerolog.New(
 		zerolog.ConsoleWriter{
@@ -280,31 +294,40 @@ func main() {
 		},
 	).With().Timestamp().Logger()
 
+	// Create a context that can be canceled
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Handle interrupt signal
 	go func() {
 		c := make(chan os.Signal, 1)
 		signal.Notify(c, os.Interrupt)
 		<-c
 		log.Info().Msg("Exit on SIGINT")
-		fc.Close()
+		cancel()
 	}()
 
-	var wg sync.WaitGroup
-	wg.Add(1)
+	// Run flexclient
 	go func() {
 		fc.Run()
-		tc.Close()
-		rl.Close()
-		wg.Done()
+		cancel()
 	}()
 
+	// Handle cluster connection
 	go func() {
 		lines := bufio.NewScanner(tc)
 		for lines.Scan() {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
 			line := lines.Text()
 			if m := spotPattern.FindStringSubmatch(line); m != nil {
 				remove := cfg.QRT && qrtPattern.MatchString(m[8])
 				logToConsole(rl.Stdout(), m, remove)
-				sendToFlex(fc, m, remove)
+				sendToFlex(ctx, fc, m, remove)
 				cleanupSpots()
 			} else {
 				var prompt = false
@@ -321,11 +344,18 @@ func main() {
 				}
 			}
 		}
-		fc.Close()
+		cancel()
 	}()
 
+	// Handle user input
 	go func() {
 		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
 			line, err := rl.Readline()
 			if err != nil {
 				break
@@ -335,7 +365,7 @@ func main() {
 			}
 			fmt.Fprintln(tc, line)
 		}
-		fc.Close()
+		cancel()
 	}()
 
 	if cfg.Callsign != "" {
@@ -343,5 +373,6 @@ func main() {
 		fmt.Fprintf(tc, "%s\n", cfg.Callsign)
 	}
 
-	wg.Wait()
+	// Wait for context to be canceled
+	<-ctx.Done()
 }
